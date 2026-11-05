@@ -32,6 +32,11 @@ typedef struct {
 } Placement;
 
 typedef struct {
+    int       w, h;
+    uint32_t *px;
+} FocusImage;
+
+typedef struct {
     int   cols, rows;
     Cell *main_buf, *alt_buf, *cells; /* cells -> active buffer */
     bool  alt;
@@ -64,6 +69,10 @@ typedef struct {
     uint32_t  bg_rgb;
     Placement img[TERM_MAX_IMG];
     int       nimg, next_id;
+    bool      image_focus;
+    FocusImage focus_img[TERM_MAX_IMG];
+    int       nfocus, focus_index;
+    uint64_t  focus_serial;
     char      bindir[256];      /* holds the generated `.image` command */
     char      video_path[4096];
     uint64_t  video_serial;
@@ -81,6 +90,7 @@ void term_init(Term *t, int cols, int rows);
 bool term_spawn(Term *t);
 void term_free(Term *t);
 void term_resize(Term *t, int cols, int rows);
+void term_close_image_focus(Term *t);
 bool term_pump(Term *t);                          /* read pty, feed parser; true if data */
 void term_feed(Term *t, const char *s, size_t n); /* feed bytes to parser */
 void term_write(Term *t, const char *s, size_t n);/* send bytes to child */

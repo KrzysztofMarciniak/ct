@@ -22,6 +22,12 @@ Use `make uninstall` to remove it. Set `PREFIX` to change the install prefix.
 
 ## View media
 
-In the running terminal, use `.image /path/to/photo.png` for PNG, JPEG, or WebP
-images, or `.video /path/to/video.mp4` for video. Media appears inline in the
-terminal.
+In the running terminal, use `.image -inline /path/to/photo.png` to place PNG,
+JPEG, or WebP images inline (`.image /path/to/photo.png` remains an inline
+shorthand), or `.image -focus /path/to/photo.png [...]` to open a focused image
+view with optional next/previous images. Without an explicit mode, more than
+five image paths opens the focus view; otherwise images stay inline. In the
+focused view, `h`/`l`/`k`/`j`
+or the arrow keys pan, `Shift+h`/`Shift+l` switch images, `+`/`-` zoom, `0`
+resets zoom, and `Esc` or `q` closes it. `.video /path/to/video.mp4` plays
+video inline.

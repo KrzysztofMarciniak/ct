@@ -18,6 +18,7 @@
 #include "video.h"
 
 #define PAD 0
+#define FOCUS_BAR_H 42
 
 #define DEFAULT_BG     0x1a1b26u
 #define DEFAULT_FG     0xc0caf5u
@@ -36,9 +37,12 @@ static XIC      ic;
 static Atom     a_delete, a_clip, a_utf8, a_prop;
 static int      winw = 960, winh = 600;
 static int      g_cw, g_ch;
-static bool     focused = true, quit;
+static bool     focused = true, quit, dirty = true;
 static Window   video_window;
 static bool     video_window_mapped;
+static double   image_zoom = 1.0;
+static int      image_pan_x, image_pan_y;
+static uint64_t image_focus_serial;
 static XrmDatabase xrdb;
 static uint32_t bg_rgb = DEFAULT_BG, fg_rgb = DEFAULT_FG, cursor_rgb = DEFAULT_CURSOR;
 static char font_pattern[256] = "monospace:pixelsize=18";
@@ -246,7 +250,7 @@ static void draw_term(const Term *t, Clay_BoundingBox b) {
         }
     }
 
-    if (t->cursor_visible) {
+    if (t->cursor_visible && !t->image_focus) {
         int x = x0 + t->cx * g_cw, y = y0 + t->cy * g_ch;
         XftColor cc = xc_rgb(cursor_rgb);
         if (focused) {
@@ -289,6 +293,97 @@ static void render(Clay_RenderCommandArray cmds) {
     }
 }
 
+static double focused_image_scale(const Term *t, int width, int height) {
+    const FocusImage *image = &t->focus_img[t->focus_index];
+    double sx = (double)width / image->w;
+    double sy = (double)height / image->h;
+    double scale = sx < sy ? sx : sy;
+    return scale * image_zoom;
+}
+
+static void clamp_image_pan(const Term *t) {
+    if (!t->nfocus) return;
+    int height = winh - FOCUS_BAR_H;
+    if (height < 1) height = 1;
+    double scale = focused_image_scale(t, winw, height);
+    const FocusImage *image = &t->focus_img[t->focus_index];
+    double max_x = ((double)image->w * scale - winw) / 2.0;
+    double max_y = ((double)image->h * scale - height) / 2.0;
+    if (max_x < 0) max_x = 0;
+    if (max_y < 0) max_y = 0;
+    if (image_pan_x > max_x) image_pan_x = (int)max_x;
+    if (image_pan_x < -max_x) image_pan_x = (int)-max_x;
+    if (image_pan_y > max_y) image_pan_y = (int)max_y;
+    if (image_pan_y < -max_y) image_pan_y = (int)-max_y;
+}
+
+static void zoom_image(double factor) {
+    image_zoom *= factor;
+    if (image_zoom < 0.25) image_zoom = 0.25;
+    if (image_zoom > 8.0) image_zoom = 8.0;
+    clamp_image_pan(&term);
+    dirty = true;
+}
+
+static void draw_focused_image(const Term *t) {
+    if (!t->image_focus || !t->nfocus) return;
+    const FocusImage *image = &t->focus_img[t->focus_index];
+    if (!image->px || image->w <= 0 || image->h <= 0) return;
+
+    int view_h = winh - FOCUS_BAR_H;
+    if (view_h < 1) view_h = 1;
+    XftColor bg = xc_rgb(bg_rgb);
+    XftDrawRect(draw, &bg, 0, 0, (unsigned)winw, (unsigned)winh);
+
+    double scale = focused_image_scale(t, winw, view_h);
+    double image_w = (double)image->w * scale;
+    double image_h = (double)image->h * scale;
+    int image_x = (int)((winw - image_w) / 2.0 + image_pan_x);
+    int image_y = (int)((view_h - image_h) / 2.0 + image_pan_y);
+    int left = image_x < 0 ? 0 : image_x;
+    int top = image_y < 0 ? 0 : image_y;
+    int right = image_x + (int)image_w;
+    int bottom = image_y + (int)image_h;
+    if (right > winw) right = winw;
+    if (bottom > view_h) bottom = view_h;
+
+    if (right > left && bottom > top) {
+        int width = right - left, height = bottom - top;
+        XImage *xi = XCreateImage(dpy, vis, (unsigned)DefaultDepth(dpy, scr), ZPixmap,
+                                  0, NULL, (unsigned)width, (unsigned)height, 32, 0);
+        if (xi) {
+            size_t bytes = (size_t)xi->bytes_per_line * (size_t)height;
+            xi->data = calloc(1, bytes);
+            if (xi->data) {
+                for (int y = 0; y < height; y++) {
+                    int sy = (int)(((top + y - image_y) / scale));
+                    if (sy < 0) sy = 0;
+                    if (sy >= image->h) sy = image->h - 1;
+                    for (int x = 0; x < width; x++) {
+                        int sx = (int)(((left + x - image_x) / scale));
+                        if (sx < 0) sx = 0;
+                        if (sx >= image->w) sx = image->w - 1;
+                        unsigned long pixel = image->px[(size_t)sy * (size_t)image->w + (size_t)sx];
+                        XPutPixel(xi, x, y, pixel);
+                    }
+                }
+                XPutImage(dpy, back, gc, xi, 0, 0, left, top, (unsigned)width, (unsigned)height);
+            }
+            XDestroyImage(xi);
+        }
+    }
+
+    XftColor bar = xc(0x24, 0x26, 0x33);
+    XftDrawRect(draw, &bar, 0, winh - FOCUS_BAR_H, (unsigned)winw, FOCUS_BAR_H);
+    XftColor fg = xc_rgb(fg_rgb);
+    char controls[160];
+    snprintf(controls, sizeof controls,
+             "Image %d/%d   Zoom %d%%   h/j/k/l pan   Shift+h/l prev/next   +/- zoom   0 reset   Esc/q close",
+             t->focus_index + 1, t->nfocus, (int)(image_zoom * 100.0 + 0.5));
+    XftDrawStringUtf8(draw, &fg, tfont, 16, winh - 15,
+                      (const FcChar8 *)controls, (int)strlen(controls));
+}
+
 static void make_backbuffer(void) {
     if (back) XFreePixmap(dpy, back);
     back = XCreatePixmap(dpy, win, (unsigned)winw, (unsigned)winh, (unsigned)DefaultDepth(dpy, scr));
@@ -298,6 +393,12 @@ static void make_backbuffer(void) {
 
 static void redraw(void) {
     prune_icache(&term);
+    if (term.image_focus && image_focus_serial != term.focus_serial) {
+        image_focus_serial = term.focus_serial;
+        image_zoom = 1.0;
+        image_pan_x = image_pan_y = 0;
+    }
+    if (term.image_focus) clamp_image_pan(&term);
     Clay_SetLayoutDimensions((Clay_Dimensions){ (float)winw, (float)winh });
 
     Clay_BeginLayout();
@@ -323,6 +424,7 @@ static void redraw(void) {
     XftColor bg = xc_rgb(bg_rgb);
     XftDrawRect(draw, &bg, 0, 0, (unsigned)winw, (unsigned)winh);
     render(cmds);
+    draw_focused_image(&term);
     XCopyArea(dpy, back, win, gc, 0, 0, (unsigned)winw, (unsigned)winh, 0, 0);
     XFlush(dpy);
 }
@@ -384,6 +486,38 @@ static void on_key(XKeyEvent *ke) {
         n = XLookupString(ke, buf, sizeof buf - 1, &ks, NULL);
     }
     bool ctrl = ke->state & ControlMask, alt = ke->state & Mod1Mask, shift = ke->state & ShiftMask;
+
+    if (term.image_focus) {
+        if (ks == XK_Escape || ks == XK_q || ks == XK_Q) {
+            term_close_image_focus(&term);
+            dirty = true;
+        } else if (term.nfocus > 1 && (ks == XK_H || ks == XK_L)) {
+            int previous = term.focus_index;
+            if (ks == XK_H && term.focus_index > 0) term.focus_index--;
+            if (ks == XK_L && term.focus_index < term.nfocus - 1) term.focus_index++;
+            if (term.focus_index != previous) {
+                term.focus_serial++;
+                dirty = true;
+            }
+        } else if (ks == XK_plus || ks == XK_equal || ks == XK_KP_Add) {
+            zoom_image(1.25);
+        } else if (ks == XK_minus || ks == XK_KP_Subtract) {
+            zoom_image(1.0 / 1.25);
+        } else if (ks == XK_0 || ks == XK_Home) {
+            image_zoom = 1.0;
+            image_pan_x = image_pan_y = 0;
+            dirty = true;
+        } else if (ks == XK_Left || ks == XK_Right || ks == XK_Up || ks == XK_Down ||
+                   ks == XK_h || ks == XK_l || ks == XK_k || ks == XK_j) {
+            if (ks == XK_Left || ks == XK_h) image_pan_x += 60;
+            if (ks == XK_Right || ks == XK_l) image_pan_x -= 60;
+            if (ks == XK_Up || ks == XK_k) image_pan_y += 60;
+            if (ks == XK_Down || ks == XK_j) image_pan_y -= 60;
+            clamp_image_pan(&term);
+            dirty = true;
+        }
+        return;
+    }
 
     if (ctrl && shift && video.active && ks == XK_space) { video_toggle_pause(&video); return; }
     if (ctrl && shift && video.active && (ks == XK_Left || ks == XK_Right)) {
@@ -471,7 +605,6 @@ int main(void) {
     if (!term_spawn(&term)) { fprintf(stderr, "clayterm: forkpty failed\n"); return 1; }
 
     char last_title[128] = "";
-    bool dirty = true;
     int xfd = ConnectionNumber(dpy);
 
     while (!quit) {
@@ -485,7 +618,12 @@ int main(void) {
             case FocusIn:       focused = true; dirty = true; break;
             case FocusOut:      focused = false; dirty = true; break;
             case ButtonPress:
-                if (ev.xbutton.button == Button2) request_paste(XA_PRIMARY);
+                if (term.image_focus) {
+                    if (ev.xbutton.button == Button4 || ev.xbutton.button == Button5)
+                        zoom_image(ev.xbutton.button == Button4 ? 1.25 : 1.0 / 1.25);
+                } else if (ev.xbutton.button == Button2) {
+                    request_paste(XA_PRIMARY);
+                }
                 break;
             case SelectionNotify: on_selection(&ev.xselection); break;
             case ConfigureNotify:

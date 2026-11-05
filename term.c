@@ -362,9 +362,56 @@ static void newline_cr(Term *t) {
     linefeed(t);
 }
 
-/* OSC 7770 ; /abs/path : draw image at cursor, advance cursor below it */
-static void place_image(Term *t, const char *path) {
+static void term_begin_focus_gallery(Term *t) {
+    term_close_image_focus(t);
+}
+
+static void term_set_focus_image(Term *t, uint32_t *px, int w, int h) {
+    if (t->nfocus == TERM_MAX_IMG) {
+        free(t->focus_img[0].px);
+        memmove(&t->focus_img[0], &t->focus_img[1],
+                sizeof(t->focus_img[0]) * (TERM_MAX_IMG - 1));
+        t->nfocus--;
+        if (t->focus_index > 0) t->focus_index--;
+    }
+    if (!t->image_focus) {
+        t->focus_index = 0;
+        t->image_focus = true;
+        t->focus_serial++;
+    }
+    t->focus_img[t->nfocus++] = (FocusImage){ .w = w, .h = h, .px = px };
+}
+
+void term_close_image_focus(Term *t) {
+    for (int i = 0; i < t->nfocus; i++) free(t->focus_img[i].px);
+    t->nfocus = 0;
+    t->focus_index = 0;
+    t->image_focus = false;
+}
+
+/* OSC 7770 ; mode ; /abs/path : display an image inline or in the focus viewer */
+static void place_image(Term *t, const char *mode, const char *path) {
     if (t->alt || t->cell_w <= 0 || t->cell_h <= 0) return;
+    size_t path_len = strlen(path);
+    if (!path_len || path_len >= 4096) return;
+    for (size_t i = 0; i < path_len; i++) {
+        unsigned char ch = (unsigned char)path[i];
+        if (ch < 0x20 || ch == 0x7f) return;
+    }
+
+    if (!strcmp(mode, "focus")) {
+        int w = 0, h = 0;
+        uint32_t *px = image_load(path, 0, 0, t->bg_rgb, &w, &h);
+        if (!px) {
+            put_str(t, "image: cannot decode ");
+            put_str(t, path);
+            newline_cr(t);
+            return;
+        }
+        term_set_focus_image(t, px, w, h);
+        return;
+    }
+    if (strcmp(mode, "inline")) return;
     if (t->cx != 0) newline_cr(t);
 
     int maxh = (t->rows - 1) * t->cell_h;
@@ -377,6 +424,7 @@ static void place_image(Term *t, const char *path) {
         newline_cr(t);
         return;
     }
+    term_close_image_focus(t);
     if (t->nimg == TERM_MAX_IMG) drop_image(t, 0);
 
     Placement *p = &t->img[t->nimg++];
@@ -423,7 +471,21 @@ static void place_video(Term *t, const char *path) {
 
 static void osc_end(Term *t) {
     t->osc[t->osc_len] = 0;
-    if (!strncmp(t->osc, "7770;", 5)) { place_image(t, t->osc + 5); return; }
+    if (!strncmp(t->osc, "7770;", 5)) {
+        char *payload = t->osc + 5;
+        char *sep = strchr(payload, ';');
+        size_t mode_len = sep ? (size_t)(sep - payload) : 0;
+        if (sep && mode_len == 11 && !memcmp(payload, "focus-start", 11)) {
+            term_begin_focus_gallery(t);
+        } else if (sep && ((mode_len == 6 && !memcmp(payload, "inline", 6)) ||
+                           (mode_len == 5 && !memcmp(payload, "focus", 5)))) {
+            *sep = 0;
+            place_image(t, payload, sep + 1);
+        } else {
+            place_image(t, "inline", payload);
+        }
+        return;
+    }
     if (!strncmp(t->osc, "7771;", 5)) { place_video(t, t->osc + 5); return; }
     if ((t->osc[0] == '0' || t->osc[0] == '2') && t->osc[1] == ';') {
         strncpy(t->title, t->osc + 2, sizeof t->title - 1);
@@ -545,10 +607,15 @@ void term_init(Term *t, int cols, int rows) {
 
 static const char image_script[] =
     "#!/bin/sh\n"
-    "[ $# -ge 1 ] || { echo 'usage: .image FILE...' >&2; exit 1; }\n"
+    "mode=inline\n"
+    "explicit=0\n"
+    "case ${1-} in -inline) shift; explicit=1 ;; -focus) mode=focus; shift; explicit=1 ;; esac\n"
+    "[ $# -ge 1 ] || { echo 'usage: .image [-inline|-focus] FILE...' >&2; exit 1; }\n"
+    "[ \"$explicit\" -eq 1 ] || [ $# -le 5 ] || mode=focus\n"
+    "[ \"$mode\" != focus ] || printf '\\033]7770;focus-start;\\007'\n"
     "for f in \"$@\"; do\n"
     "  case $f in /*) p=$f ;; *) p=$PWD/$f ;; esac\n"
-    "  if [ -r \"$p\" ]; then printf '\\033]7770;%s\\007' \"$p\"\n"
+    "  if [ -r \"$p\" ]; then printf '\\033]7770;%s;%s\\007' \"$mode\" \"$p\"\n"
     "  else echo \".image: cannot read $f\" >&2; fi\n"
     "done\n";
 
@@ -607,6 +674,7 @@ bool term_spawn(Term *t) {
 
 void term_free(Term *t) {
     clear_images(t);
+    term_close_image_focus(t);
     if (t->bindir[0]) {
         char p[300];
         snprintf(p, sizeof p, "%s/.image", t->bindir);
