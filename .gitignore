@@ -1,0 +1,9 @@
+# Generated build files
+/ct
+/clayterm
+/clay.h
+*.o
+*.tmp
+
+# Local desktop metadata
+.DS_Store
